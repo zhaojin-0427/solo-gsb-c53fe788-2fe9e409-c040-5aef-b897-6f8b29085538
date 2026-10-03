@@ -33,13 +33,23 @@ SEED_VERSIONS = {
 def seed(conn) -> None:
     from . import db
 
-    existing = set(db.list_factor_versions(conn))
-    for version, factors in SEED_VERSIONS.items():
-        if version in existing:
-            continue
-        with conn:
+    # BEGIN IMMEDIATE serialises first boot across independent processes:
+    # the second process only reads the version list after the first one has
+    # committed, so identical seed rows can never collide on the
+    # factor_versions primary key.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = set(db.list_factor_versions(conn))
+        for version, factors in SEED_VERSIONS.items():
+            if version in existing:
+                continue
             db.insert_factor_version(conn, version, [
                 {"ref": ref, "name": name, "unit": unit,
                  "kg_co2e_per_unit": value}
                 for ref, name, unit, value in factors
             ])
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise

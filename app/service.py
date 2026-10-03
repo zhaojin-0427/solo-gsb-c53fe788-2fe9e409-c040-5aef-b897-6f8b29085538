@@ -18,9 +18,10 @@ from .models import AccountingRequest, FactorVersionRequest, RecalculateRequest
 ZERO = Decimal("0")
 
 # One shared SQLite connection per process: serialise check-then-write
-# sequences so concurrent submissions can't interleave.  Factor-version
-# registration additionally opens an IMMEDIATE transaction so that
-# multi-process deployments get the same all-or-nothing guarantee.
+# sequences so same-process submissions can't interleave.  Every write path
+# additionally opens a BEGIN IMMEDIATE transaction, so multi-process
+# deployments sharing one database file get the same all-or-nothing
+# arbitration (factor versions and snapshot identity alike).
 _write_lock = threading.RLock()
 
 
@@ -170,53 +171,139 @@ def _row_to_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@_serial
-def submit_assessment(conn: sqlite3.Connection,
-                      req: AccountingRequest) -> Dict[str, Any]:
-    """Idempotent assessment submission.
+def _client_key_conflict(client_request_id: Optional[str],
+                         row: Dict[str, Any]) -> ConflictError:
+    return ConflictError(
+        "CLIENT_REQUEST_ID_CONFLICT",
+        f"client_request_id={client_request_id} 已用于另一核算请求",
+        {"existing_snapshot_id": row["id"],
+         "existing_input_hash": row["input_hash"]})
 
-    The snapshot key is the canonical input summary plus factor version.
-    Replaying the same payload returns the *same* snapshot.  A different
-    payload reusing a ``client_request_id`` is rejected as a conflict.
+
+def _adjudicate_snapshot(conn: sqlite3.Connection, inhash: str,
+                         client_request_id: Optional[str],
+                         create_row) -> Dict[str, Any]:
+    """Cross-connection arbitration of snapshot identity.
+
+    Runs inside one ``BEGIN IMMEDIATE`` transaction (the SQLite write lock is
+    held from the first read), so independent processes serialise on the same
+    committed evidence:
+
+    * a stored row with the same input hash  -> replay it (HTTP 200);
+    * the client key already anchors a row whose hash differs -> 409;
+    * otherwise the caller's ``create_row`` inserts exactly one new
+      immutable snapshot (HTTP 201).
+
+    ``create_row(conn)`` performs factor lookup, validation, the accounting
+    run and the INSERT, all inside the transaction held here; identity is
+    arbitrated before any of that work so replays/conflicts never recompute.
+    If a contender commits between this connection's lock acquisition and its
+    insert (the UNIQUE indexes are the last line of defence),
+    ``IntegrityError`` is settled by re-reading the committed row instead of
+    surfacing a database error — callers must never see partial evidence.
     """
-    inhash = input_hash(req)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        by_client = (
+            db.get_snapshot_by_client_id(conn, client_request_id)
+            if client_request_id else None)
+        if by_client is not None and by_client["input_hash"] != inhash:
+            conn.rollback()
+            raise _client_key_conflict(client_request_id, by_client)
 
+        existing = db.get_snapshot_by_hash(conn, inhash)
+        if existing is not None:
+            conn.rollback()
+            snap = _row_to_snapshot(existing)
+            snap["idempotent_replay"] = True
+            return snap
+
+        snapshot_id = create_row(conn)
+        conn.commit()
+        created = db.get_snapshot(conn, snapshot_id)
+        snap = _row_to_snapshot(created)
+        snap["idempotent_replay"] = False
+        return snap
+    except ConflictError:
+        raise
+    except sqlite3.IntegrityError:
+        # Lost a race against another connection: release the lock and
+        # adjudicate against the now-committed evidence.
+        if conn.in_transaction:
+            conn.rollback()
+        return _settle_after_integrity_error(conn, inhash, client_request_id)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _settle_after_integrity_error(conn: sqlite3.Connection, inhash: str,
+                                  client_request_id: Optional[str]
+                                  ) -> Dict[str, Any]:
+    """Return the winner's committed result after a UNIQUE-index collision."""
+    if client_request_id:
+        by_client = db.get_snapshot_by_client_id(conn, client_request_id)
+        if by_client is not None and by_client["input_hash"] != inhash:
+            raise _client_key_conflict(client_request_id, by_client)
     existing = db.get_snapshot_by_hash(conn, inhash)
-    if existing is None and req.client_request_id:
-        by_client = db.get_snapshot_by_client_id(
-            conn, req.client_request_id)
-        if by_client is not None:
-            raise ConflictError(
-                "CLIENT_REQUEST_ID_CONFLICT",
-                f"client_request_id={req.client_request_id} 已用于另一核算请求",
-                {"existing_snapshot_id": by_client["id"]})
-
     if existing is not None:
         snap = _row_to_snapshot(existing)
         snap["idempotent_replay"] = True
         return snap
+    # Should be unreachable with the UNIQUE indexes in place; report a
+    # business conflict rather than leaking the database exception.
+    raise ConflictError(
+        "SNAPSHOT_WRITE_CONFLICT",
+        "快照并发写入冲突，请依据已提交快照重试或更换 client_request_id")
 
-    factors = _load_factors(conn, req.factor_version)
-    result = to_jsonable(calculate(req, factors))
 
-    # Store the original request; the hash itself is the evidence anchor.
+@_serial
+def submit_assessment(conn: sqlite3.Connection,
+                      req: AccountingRequest) -> Dict[str, Any]:
+    """Idempotent assessment submission (see ``_submit_assessment``)."""
+    return _submit_assessment(conn, req)
+
+
+def _submit_assessment(conn: sqlite3.Connection,
+                       req: AccountingRequest) -> Dict[str, Any]:
+    """Idempotent assessment submission.
+
+    The snapshot key is the canonical input summary plus factor version.
+    Replaying the same payload returns the *same* snapshot (200).  A
+    different payload reusing a ``client_request_id`` is rejected with 409.
+    Identity is arbitrated inside one cross-connection ``BEGIN IMMEDIATE``
+    transaction, so concurrent identical submissions produce exactly one
+    snapshot and every contender replays the committed winner.
+    """
+    inhash = input_hash(req)
+
+    # Identity is adjudicated against committed evidence *before* the new
+    # payload is validated: a request reusing another client key is a 409
+    # even if the new payload would independently fail validation.  Factor
+    # lookup and the accounting run only happen for the genuine creator,
+    # inside the same all-or-nothing transaction.
     request_json = req.model_dump_json()
     snapshot_id = _new_snapshot_id(inhash)
-    db.insert_snapshot(
-        conn,
-        snapshot_id=snapshot_id,
-        input_hash=inhash,
-        client_request_id=req.client_request_id,
-        factor_version=req.factor_version,
-        allocation_method=req.allocation_method,
-        source_snapshot=None,
-        request_json=request_json,
-        result_json=json.dumps(result, ensure_ascii=False),
-    )
-    created = db.get_snapshot(conn, snapshot_id)
-    snap = _row_to_snapshot(created)
-    snap["idempotent_replay"] = False
-    return snap
+
+    def create_row(tx: sqlite3.Connection) -> str:
+        factors = _load_factors(tx, req.factor_version)
+        result = to_jsonable(calculate(req, factors))
+        db.insert_snapshot(
+            tx,
+            snapshot_id=snapshot_id,
+            input_hash=inhash,
+            client_request_id=req.client_request_id,
+            factor_version=req.factor_version,
+            allocation_method=req.allocation_method,
+            source_snapshot=None,
+            request_json=request_json,
+            result_json=json.dumps(result, ensure_ascii=False),
+        )
+        return snapshot_id
+
+    return _adjudicate_snapshot(conn, inhash, req.client_request_id,
+                                create_row)
 
 
 def list_snapshots(conn, limit: int, offset: int) -> Dict[str, Any]:
@@ -342,11 +429,20 @@ def _factor_changes(old_result: Dict[str, Any],
 @_serial
 def recalculate(conn, snapshot_id: str, body: RecalculateRequest
                 ) -> Dict[str, Any]:
+    return _recalculate(conn, snapshot_id, body)
+
+
+def _recalculate(conn, snapshot_id: str, body: RecalculateRequest
+                 ) -> Dict[str, Any]:
     """Replay an archived input summary with a new factor version.
 
     The old snapshot is never modified: a brand-new immutable snapshot is
     stored and returned together with per-product and per-factor diffs.
-    Replaying the same (snapshot, new version) pair is idempotent.
+    Replaying the same (snapshot, new version) pair is idempotent (200).
+    Creating the new snapshot goes through the same cross-connection
+    ``BEGIN IMMEDIATE`` arbitration as ``POST /api/assessments``: a
+    ``client_request_id`` already bound to a different input hash is a 409,
+    and concurrent identical recalculations share one snapshot.
     """
     row = db.get_snapshot(conn, snapshot_id)
     if row is None:
@@ -366,36 +462,27 @@ def recalculate(conn, snapshot_id: str, body: RecalculateRequest
                                  "client_request_id": body.client_request_id})
 
     inhash = input_hash(req)
-    existing = db.get_snapshot_by_hash(conn, inhash)
-    if existing is not None:
-        new_snap = _row_to_snapshot(existing)
-        new_snap["idempotent_replay"] = True
-    else:
-        if body.client_request_id:
-            by_client = db.get_snapshot_by_client_id(
-                conn, body.client_request_id)
-            if by_client is not None and by_client["id"] != snapshot_id:
-                raise ConflictError(
-                    "CLIENT_REQUEST_ID_CONFLICT",
-                    f"client_request_id={body.client_request_id} "
-                    "已用于另一核算请求",
-                    {"existing_snapshot_id": by_client["id"]})
-        factors = _load_factors(conn, body.factor_version)
+    request_json = req.model_dump_json()
+    new_id = _new_snapshot_id(inhash)
+
+    def create_row(tx: sqlite3.Connection) -> str:
+        factors = _load_factors(tx, body.factor_version)
         new_result = to_jsonable(calculate(req, factors))
-        new_id = _new_snapshot_id(inhash)
         db.insert_snapshot(
-            conn,
+            tx,
             snapshot_id=new_id,
             input_hash=inhash,
             client_request_id=body.client_request_id,
             factor_version=body.factor_version,
             allocation_method=row["allocation_method"],
             source_snapshot=snapshot_id,
-            request_json=req.model_dump_json(),
+            request_json=request_json,
             result_json=json.dumps(new_result, ensure_ascii=False),
         )
-        new_snap = _row_to_snapshot(db.get_snapshot(conn, new_id))
-        new_snap["idempotent_replay"] = False
+        return new_id
+
+    new_snap = _adjudicate_snapshot(conn, inhash, body.client_request_id,
+                                    create_row)
 
     diffs = _diff_products(old_result, new_snap["result"])
     changed = [d for d in diffs if d["status"] != "unchanged"]
