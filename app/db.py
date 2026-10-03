@@ -38,8 +38,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_input_hash
     ON snapshots(input_hash);
-CREATE INDEX IF NOT EXISTS idx_snapshots_client
-    ON snapshots(client_request_id);
+-- One client key may ever anchor one snapshot.  Combined with the
+-- input_hash unique index, an IMMEDIATE transaction can arbitrate both
+-- rules atomically even when independent processes race to submit.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_client
+    ON snapshots(client_request_id)
+    WHERE client_request_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_snapshots_source
     ON snapshots(source_snapshot);
 CREATE INDEX IF NOT EXISTS idx_factors_version ON factors(version);
@@ -56,7 +60,10 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    # Independent processes arbitrate snapshot writes inside BEGIN
+    # IMMEDIATE transactions; give lock losers a generous grace period to
+    # wait for the winner instead of failing with SQLITE_BUSY.
+    conn.execute("PRAGMA busy_timeout = 30000")
     if first_time:
         conn.executescript(SCHEMA)
         conn.commit()
@@ -65,6 +72,20 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Upgrade databases created before client_request_id became unique: the
+    # schema migration's CREATE UNIQUE INDEX IF NOT EXISTS is skipped when the
+    # old *non-unique* index of the same name is already present.  Only
+    # re-create it when the stored index does not enforce uniqueness.
+    meta = conn.execute(
+        "SELECT il.\"unique\" FROM pragma_index_list('snapshots') il "
+        "WHERE il.name = 'idx_snapshots_client'"
+    ).fetchone()
+    if meta is not None and meta[0] == 0:
+        conn.execute("DROP INDEX idx_snapshots_client")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_snapshots_client "
+            "ON snapshots(client_request_id) "
+            "WHERE client_request_id IS NOT NULL")
     conn.commit()
 
 
@@ -121,15 +142,22 @@ def insert_snapshot(conn: sqlite3.Connection, *, snapshot_id: str,
                     factor_version: str, allocation_method: str,
                     source_snapshot: Optional[str],
                     request_json: str, result_json: str) -> None:
-    with conn:
-        conn.execute(
-            "INSERT INTO snapshots(id, input_hash, client_request_id, "
-            "factor_version, allocation_method, source_snapshot, "
-            "request_json, result_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (snapshot_id, input_hash, client_request_id, factor_version,
-             allocation_method, source_snapshot, request_json, result_json,
-             utcnow()))
+    """Insert an immutable snapshot row.
+
+    Must run inside a caller-managed transaction (the service layer opens
+    ``BEGIN IMMEDIATE`` before arbitrating ``input_hash`` /
+    ``client_request_id``).  Raising ``sqlite3.IntegrityError`` on a
+    duplicate key is intentional — the service layer catches it and
+    re-reads the committed winner instead of leaking the database error.
+    """
+    conn.execute(
+        "INSERT INTO snapshots(id, input_hash, client_request_id, "
+        "factor_version, allocation_method, source_snapshot, "
+        "request_json, result_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (snapshot_id, input_hash, client_request_id, factor_version,
+         allocation_method, source_snapshot, request_json, result_json,
+         utcnow()))
 
 
 def get_snapshot(conn: sqlite3.Connection, snapshot_id: str

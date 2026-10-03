@@ -21,6 +21,13 @@
   传递比例、因子版本与因子值（证据随快照固化）
 - **幂等**：以「规范化输入摘要 + 因子版本」的 SHA-256 作为幂等键，重复提交返回同一快照；
   节点重排不产生新快照；`client_request_id` 冲突返回 409
+- **并发安全（跨连接/跨进程）**：`POST /api/assessments` 与
+  `POST /api/snapshots/{id}/recalculate` 的「查重 → 比对客户端键 → 写入」在**单条
+  `BEGIN IMMEDIATE` 事务**内裁决，并由 `input_hash` 唯一索引与 `client_request_id`
+  部分唯一索引共同兜底。两个独立服务进程同时提交时：相同输入摘要恰好一个 `201`，
+  其余以 `200` 重放同一份不可变快照；同一客户端键对应不同摘要恰好一个 `201`，
+  其余返回 `409`；落败方一律依据已提交记录作答，不会向客户端泄露
+  `IntegrityError`、也不会留下部分行或两份快照。
 - **因子版本只增不改**：`POST /api/factor-versions` 对同名版本仅在因子 ref 集合、名称、单位
   与 Decimal 数值（`0.10` 与 `0.1` 视为相同）全部一致时幂等返回 200；任一差异返回 409 且
   **不写入/不删除任何行**，并发同名提交由 `BEGIN IMMEDIATE` 事务串行化，新内容必须改用新版本名
@@ -271,6 +278,59 @@ JSON
 即使把 `processes` 数组里两个过程的顺序颠倒，规范化摘要哈希相同，仍命中同一快照；
 结果里的 `topological_order` 依旧是 `["refining", "distribution"]`。
 
+### 2.5) 并发提交的裁决（两个服务进程同时提交）
+
+幂等不是「先查后写」：两个**独立进程**（各自持有独立的 SQLite 连接与写锁）同时提交时，
+朴素的 `SELECT 不存在 → INSERT` 会在写阶段相撞，后提交者抛出
+`sqlite3.IntegrityError: UNIQUE constraint failed: snapshots.input_hash`；
+而同一 `client_request_id` 搭配不同输入并发提交时又可能插入两份快照。
+
+服务在**单条 `BEGIN IMMEDIATE` 事务**内完成「按 `input_hash` 查重 → 按
+`client_request_id` 查重 → 插入」，配合两个唯一约束
+（`input_hash` 唯一索引；`client_request_id` 的部分唯一索引，仅约束非空键）
+跨连接串行裁决；写锁等待时间 `busy_timeout=30000ms`。即便落败方在拿到写锁前
+已做过一次读、且在其 `INSERT` 时才撞上唯一约束，服务也会**回滚后重新读取已提交
+记录**作答，绝不把数据库异常透出给客户端：
+
+| 并发情形 | 裁决结果 |
+| --- | --- |
+| 相同输入摘要（可带不同/相同 `client_request_id`） | 恰好一个 `201`，其余 `200`，返回**同一个** `snapshot_id`；表里只有一份快照 |
+| 同一 `client_request_id` + 不同输入摘要 | 恰好一个 `201`，其余 `409 CLIENT_REQUEST_ID_CONFLICT`，`details.existing_snapshot_id` 指向胜出快照；该客户端键下只有一份快照 |
+| `POST /api/snapshots/{id}/recalculate` 并发重算同一 `(源快照, 新因子版本)` | 恰好一个 `201`，其余 `200`，返回同一个新快照；`product_diffs` / `factor_changes` 完全一致 |
+
+用两个后台进程并发提交相同请求（`req.json` 即上文请求体）：
+
+```bash
+for i in 1 2; do
+  curl -s -o /tmp/out.$i.json -w "proc$i HTTP %{http_code}\n" \
+    -X POST http://localhost:8000/api/assessments \
+    -H 'Content-Type: application/json' --data @req.json &
+done; wait
+# proc1 HTTP 201
+# proc2 HTTP 200
+python3 -c "import json;print({json.load(open(f'/tmp/out.{i}.json'))['snapshot_id'] for i in (1,2)})"
+# {'snap_404159d90ed529d8'}  —— 同一不可变快照
+```
+
+同一 `client_request_id`、两份不同输入并发提交（下面把天然气用量改为 `2000` MJ
+得到不同摘要）：一个返回 `201`，另一个返回 `409`，且 `409` 直接指向胜出快照——
+不会出现 5xx，也不会留下两份快照：
+
+```json
+{
+  "error": {
+    "code": "CLIENT_REQUEST_ID_CONFLICT",
+    "message": "client_request_id=refinery-batch-2024-001 已用于另一核算请求",
+    "details": {"existing_snapshot_id": "snap_1dedcf44482ec746"}
+  }
+}
+```
+
+旧库升级时，启动器会自动把历史上的非唯一 `idx_snapshots_client` 索引替换为
+部分唯一索引；若历史数据中已存在同一客户端键对应多份快照（即旧缺陷留下的证据），
+启动会带着 `UNIQUE constraint failed: snapshots.client_request_id` **显式失败**，
+而不是悄悄挑选或删除任何一行——证据保留，由运维决定如何归档后再启动。
+
 ### 3) 查询单产品的贡献链（证据）
 
 ```bash
@@ -366,7 +426,8 @@ curl -s -X POST \
 `factor_changes` 的新旧值同样取自**两个快照封存的 `factors_used`**，而非当前因子表：
 即使旧版本的目录行在旧版本服务中曾被覆盖，重算时报告的旧值仍是旧快照当初计算所用的值，
 与 `product_diffs` 的口径完全一致（本示例中 `ef.natural_gas` 两个版本数值相同，故不出现在
-清单中）。重算接口本身也是幂等的：第二次调用返回 `200` 与同一个新快照 ID。
+清单中）。重算接口本身也是幂等的：第二次（或与首次**并发**的）调用返回 `200` 与
+同一个新快照 ID——并发重算与并发提交遵守同一套跨连接事务裁决（见示例 2.5）。
 
 ### 5) 错误响应示例（环 + 负量 + 零分母一次性返回）
 
@@ -404,6 +465,11 @@ curl -s -X POST \
 - **证据固化**：快照表保存原始请求 JSON、完整结果 JSON（含 `factors_used` 因子值副本）、
   输入哈希、因子版本、来源快照与 UTC 时间戳，只增不改。重算差异的因子新旧值直接读两份
   `factors_used` 副本，不回查因子目录，因此与 `product_diffs` 同源、不受后续目录变化影响。
+- **并发裁决**：`input_hash` 唯一索引与 `client_request_id` 部分唯一索引在数据库层兜底；
+  核算提交与快照重算都在单条 `BEGIN IMMEDIATE` 事务内完成「查哈希 → 查客户端键 → 插入」。
+  跨进程并发时输锁方串行等待（`busy_timeout=30s`），若 `INSERT` 仍撞上刚提交的唯一键，
+  服务回滚并重读胜出记录：同哈希给 `200` 重放、异哈希同键给 `409`，绝不外泄
+  `sqlite3` 异常、绝不留下部分行。进程内另用一把 `RLock` 串行化同一连接上的查后写。
 - **因子版本只增不改**：`factors` 表只有 `INSERT` 路径（无 `UPDATE`/`REPLACE`）。登记在
   单条 `BEGIN IMMEDIATE` 事务内完成「查重 → 比对 → 插入」，配合进程内写锁，保证并发同名
   提交要么完整创建、要么幂等/409，绝不部分写入或互相覆盖。
@@ -420,8 +486,8 @@ app/
   graph.py        Kahn 拓扑排序 / Tarjan 环检测
   idempotency.py  规范化输入摘要与 SHA-256
   decimals.py     Decimal 精度、量化、JSON 化
-  db.py           SQLite schema 与快照/因子仓储（因子版本只追加）
+  db.py           SQLite schema 与快照/因子仓储（唯一索引、快照/因子只追加）
   seed.py         内置 v2023-01 / v2024-01 因子
-tests/            24 个端到端测试（pytest + TestClient）
+tests/            端到端测试（pytest + TestClient），含跨进程并发提交/重算裁决
 docker-compose.yml / Dockerfile
 ```

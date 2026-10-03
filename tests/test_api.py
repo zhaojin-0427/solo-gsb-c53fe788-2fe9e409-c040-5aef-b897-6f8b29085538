@@ -1,11 +1,252 @@
 from decimal import Decimal
+import multiprocessing as mp
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from tests.conftest import REFINERY_REQUEST
 
 
 def _products(body):
     return {p["product_id"]: p for p in body["result"]["products"]}
+
+
+# ---------------------------------------------------------------------------
+# Cross-process idempotency (each worker is an independent service process:
+# its own Python interpreter, its own sqlite3 connection and write lock).
+# ---------------------------------------------------------------------------
+
+def _mp_submit_worker(db_path, payload, queue):
+    from app import db, seed, service
+    from app.models import AccountingRequest
+
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    seed.seed(conn)
+    try:
+        snap = service.submit_assessment(
+            conn, AccountingRequest.model_validate(payload))
+        queue.put((200 if snap["idempotent_replay"] else 201,
+                   snap["snapshot_id"], None))
+    except Exception as exc:  # noqa: BLE001 - report every outcome
+        queue.put((getattr(exc, "status_code", None) or
+                   getattr(exc, "code", type(exc).__name__),
+                   None, getattr(exc, "details", None)))
+
+
+def _mp_recalculate_worker(db_path, snapshot_id, queue):
+    from app import db, service
+    from app.models import RecalculateRequest
+
+    conn = db.connect(db_path)
+    try:
+        result = service.recalculate(
+            conn, snapshot_id, RecalculateRequest(factor_version="v2024-01"))
+        snap = result["new_snapshot"]
+        queue.put((200 if snap["idempotent_replay"] else 201,
+                   snap["snapshot_id"], None))
+    except Exception as exc:  # noqa: BLE001
+        queue.put((getattr(exc, "code", type(exc).__name__), None, None))
+
+
+def _fire_processes(target, args_list, timeout=60):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [ctx.Process(target=target, args=args + (queue,))
+             for args in args_list]
+    for proc in procs:
+        proc.start()
+    results = [queue.get(timeout=timeout) for _ in procs]
+    for proc in procs:
+        proc.join()
+    assert all(proc.exitcode == 0 for proc in procs), \
+        f"a racing worker crashed: {[p.exitcode for p in procs]}"
+    return results
+
+
+@pytest.fixture
+def file_db():
+    from app import db, seed, service
+    from app.models import AccountingRequest
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)  # connect() treats a missing file as first-time use
+    conn = db.connect(path)
+    db.init_db(conn)
+    seed.seed(conn)
+    yield path, conn
+    conn.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def test_concurrent_identical_submissions_through_http(client):
+    # Same-process HTTP path: the in-process write lock plus the IMMEDIATE
+    # arbitration must still collapse identical racing submissions to one
+    # snapshot (one 201, the rest 200) — and never emit a 500.
+    def submit(_):
+        return client.post("/api/assessments", json=REFINERY_REQUEST)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        responses = list(pool.map(submit, range(6)))
+
+    statuses = sorted(r.status_code for r in responses)
+    assert 500 not in statuses
+    assert statuses == [200] * 5 + [201]
+    ids = {r.json()["snapshot_id"] for r in responses}
+    assert ids == {"snap_404159d90ed529d8"}
+
+
+def test_concurrent_same_client_key_different_inputs_through_http(client):
+    other = {**REFINERY_REQUEST,
+             "processes": [{**REFINERY_REQUEST["processes"][0],
+                            "direct_emissions": [
+                                {"source": "natural_gas", "quantity": "2000",
+                                 "unit": "MJ",
+                                 "factor_ref": "ef.natural_gas"},
+                                {"source": "electricity", "quantity": "100",
+                                 "unit": "kWh",
+                                 "factor_ref": "ef.grid_electricity"}]},
+                           REFINERY_REQUEST["processes"][1]]}
+    payloads = [{**REFINERY_REQUEST, "client_request_id": "http-race"},
+                {**other, "client_request_id": "http-race"}]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda p: client.post("/api/assessments", json=p), payloads))
+
+    assert sorted(r.status_code for r in responses) == [201, 409]
+    conflict = next(r for r in responses if r.status_code == 409).json()
+    assert conflict["error"]["code"] == "CLIENT_REQUEST_ID_CONFLICT"
+    assert 500 not in [r.status_code for r in responses]
+
+
+def test_concurrent_identical_submissions_leave_one_snapshot(file_db):
+    # Two independent processes submit byte-identical inputs: exactly one
+    # 201, the other replays with 200 — never a 500 from SQLite.
+    path, _ = file_db
+    results = _fire_processes(
+        _mp_submit_worker,
+        [(path, dict(REFINERY_REQUEST)) for _ in range(2)])
+
+    statuses = sorted(code for code, _, _ in results)
+    assert statuses == [200, 201], results
+    ids = {snapshot_id for _, snapshot_id, _ in results}
+    assert ids == {"snap_404159d90ed529d8"}
+
+    from app import db
+    conn = db.connect(path)
+    assert conn.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 1
+
+
+def test_concurrent_same_client_key_different_inputs_conflict(file_db):
+    # Same client_request_id, genuinely different canonical inputs, raced
+    # from two processes: one 201, one 409 pointing at the winner, and only
+    # one snapshot row — never two snapshots sharing the client key.
+    other = {**REFINERY_REQUEST,
+             "processes": [{**REFINERY_REQUEST["processes"][0],
+                            "direct_emissions": [
+                                {"source": "natural_gas", "quantity": "2000",
+                                 "unit": "MJ",
+                                 "factor_ref": "ef.natural_gas"},
+                                {"source": "electricity", "quantity": "100",
+                                 "unit": "kWh",
+                                 "factor_ref": "ef.grid_electricity"}]},
+                           REFINERY_REQUEST["processes"][1]]}
+    payload_a = {**REFINERY_REQUEST, "client_request_id": "race-key"}
+    payload_b = {**other, "client_request_id": "race-key"}
+
+    path, _ = file_db
+    results = _fire_processes(
+        _mp_submit_worker, [(path, payload_a), (path, payload_b)])
+
+    codes = {code for code, _, _ in results}
+    assert codes == {201, "CLIENT_REQUEST_ID_CONFLICT"}, results
+    winner = next(sid for code, sid, _ in results if code == 201)
+    loser_detail = next(detail for code, _, detail in results
+                        if code == "CLIENT_REQUEST_ID_CONFLICT")
+    assert loser_detail == {"existing_snapshot_id": winner}
+
+    from app import db
+    conn = db.connect(path)
+    rows = conn.execute(
+        "SELECT count(*) FROM snapshots "
+        "WHERE client_request_id = 'race-key'").fetchone()[0]
+    assert rows == 1
+
+
+def test_concurrent_recalculation_creates_one_snapshot(file_db):
+    from app import db, service
+    from app.models import AccountingRequest
+
+    path, conn = file_db
+    source_id = service.submit_assessment(
+        conn, AccountingRequest.model_validate(REFINERY_REQUEST))[
+        "snapshot_id"]
+
+    results = _fire_processes(
+        _mp_recalculate_worker, [(path, source_id) for _ in range(3)])
+
+    codes = sorted(code for code, _, _ in results)
+    assert codes == [200, 200, 201], results
+    ids = {snapshot_id for _, snapshot_id, _ in results}
+    assert len(ids) == 1
+    new_id = next(iter(ids))
+    assert new_id != source_id
+    assert conn.execute(
+        "SELECT count(*) FROM snapshots WHERE factor_version = 'v2024-01'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT source_snapshot FROM snapshots WHERE id = ?",
+        (new_id,)).fetchone()[0] == source_id
+
+
+def test_commit_snapshot_recovers_from_lost_insert_race(file_db):
+    # White-box: the in-transaction SELECTs are blind (as if a concurrent
+    # process' winning row only became visible at INSERT time).  The
+    # IntegrityError must be resolved from committed evidence — a 200
+    # replay, never a leaked database error.
+    from app import db, service
+    from app.idempotency import input_hash
+    from app.models import AccountingRequest
+
+    path, conn = file_db
+    req = AccountingRequest.model_validate(REFINERY_REQUEST)
+    inhash = input_hash(req)
+
+    # A "concurrent winner" already committed the row.
+    winner = service.submit_assessment(conn, req)
+    assert winner["idempotent_replay"] is False
+
+    real_lookup = db.get_snapshot_by_hash
+    seen = {"n": 0}
+
+    def blind_in_transaction(connection, input_hash_value):
+        # First call = pre-lock fast path (sees the winner); second call =
+        # the arbitration SELECT inside BEGIN IMMEDIATE (blind, as if the
+        # winning row committed only at INSERT time).
+        seen["n"] += 1
+        if seen["n"] == 2 and input_hash_value == inhash:
+            return None
+        return real_lookup(connection, input_hash_value)
+
+    db.get_snapshot_by_hash = blind_in_transaction
+    service.db.get_snapshot_by_hash = blind_in_transaction
+    try:
+        replay = service.submit_assessment(conn, req)
+    finally:
+        db.get_snapshot_by_hash = real_lookup
+        service.db.get_snapshot_by_hash = real_lookup
+
+    assert replay["idempotent_replay"] is True
+    assert replay["snapshot_id"] == winner["snapshot_id"]
+    assert conn.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 1
 
 
 def test_health_and_factor_versions(client):
